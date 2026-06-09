@@ -56,7 +56,7 @@ class AutoPilotConfig:
     too_close_area_ratio: float = 0.28
 
     # Режим збивання кегель
-    pin_mode_enabled: bool = True
+    pin_mode_enabled: bool = False
     standing_height_ratio: float = 1.1   # h/w: стояча кегля вища за широку
     hit_area_ratio: float = 0.10         # почати таран, коли кегля велика в кадрі
     knocked_zone_radius: float = 0.18    # нормалізований радіус «вже збито»
@@ -122,7 +122,11 @@ class ColorFollowAutoPilot(QObject):
         self.command_ready.emit("stop")
 
     def update_config(self, config: AutoPilotConfig) -> None:
+        pin_mode_changed = self._cfg.pin_mode_enabled != config.pin_mode_enabled
         self._cfg = config
+        if pin_mode_changed:
+            self._reset_pin_mission()
+            self._last_command = None
         if self._cfg.detector_enabled and YOLO is not None and not self._detector_available:
             try:
                 self._detector = YOLO(self._cfg.detector_model)

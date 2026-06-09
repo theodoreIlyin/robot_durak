@@ -344,10 +344,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.v_max_spin, 8, 2)
 
         self.pin_mode_checkbox = QCheckBox("Режим кеглів (збивати по черзі)")
-        self.pin_mode_checkbox.setChecked(True)
+        self.pin_mode_checkbox.setChecked(False)
         self.pin_mode_checkbox.setToolTip(
-            "Їде лише до стоячих кегель, після збиття від'їжджає назад, "
-            "оглядається і шукає наступну. Збиті кеглі запам'ятовуються."
+            "Вимкніть для простого руху до вибраного кольору. Увімкнений режим "
+            "після збиття від'їжджає назад, оглядається і шукає наступну кеглю."
         )
         layout.addWidget(self.pin_mode_checkbox, 9, 0, 1, 3)
 
