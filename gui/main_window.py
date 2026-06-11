@@ -6,6 +6,8 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
+import numpy as np
+
 from PyQt5.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QCloseEvent, QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
@@ -164,9 +166,20 @@ class MainWindow(QMainWindow):
             self._stop_video()
 
         if self._video_thread is not None and self._video_thread.isRunning():
+            # Підраховуємо лічильник примусового закриття.
+            self._close_attempts = getattr(self, "_close_attempts", 0) + 1
+            if self._close_attempts >= 2:
+                # Повторне закриття — примусово завершуємо потік і приймаємо подію.
+                if self._video_thread is not None:
+                    self._video_thread.terminate()
+                    self._video_thread.wait(1000)
+                    self._video_thread = None
+                event.accept()
+                return
             event.ignore()
             self._set_status(
-                "Відеопотік ще завершується. Повторіть закриття через кілька секунд.",
+                "Відеопотік ще завершується. "
+                "Повторіть закриття щоб примусово завершити.",
                 level="WARNING",
             )
             return
@@ -558,10 +571,12 @@ class MainWindow(QMainWindow):
         ssid = self.ssid_edit.text().strip()
         password = self.password_edit.text()
         setup_host = self.setup_host_edit.text().strip()
-        port = self.command_port_spin.value()
+        # Setup AP ESP32-CAM завжди слухає на порті 80 (HTTP),
+        # тому використовуємо фіксоване значення, а не порт WS-команд.
+        provisioning_port = 80
 
         self._run_worker(
-            lambda: self._send_wifi_action(setup_host, port, ssid, password),
+            lambda: self._send_wifi_action(setup_host, provisioning_port, ssid, password),
             self._show_status_success,
             self._show_status_error,
         )
@@ -900,8 +915,11 @@ class MainWindow(QMainWindow):
         if not self._connected or self._disconnect_requested:
             return
 
-        self._stop_video()
-        if self._video_thread is not None:
+        # _stop_video() повертає True якщо потік зупинився або ніколи не існував.
+        # self._video_thread стає None після зупинки, тому перевіряємо збережений bool,
+        # а не посилання — перевірка посилання завжди давала б False (мертвий код).
+        old_thread_stopped = self._stop_video()
+        if not old_thread_stopped:
             self._set_status(
                 "Попередній відеопотік ще завершується. Новий потік не запущено.",
                 level="WARNING",
@@ -921,28 +939,39 @@ class MainWindow(QMainWindow):
 
         self._video_thread.start()
 
-    def _stop_video(self) -> None:
-        """Зупинити MJPEG-потік і повернути placeholder відео."""
-        if self._video_thread is not None:
-            # Відписуємо автопілот, якщо він прив'язаний.
-            if self._autopilot is not None:
-                try:
-                    self._video_thread.cv_frame_ready.disconnect(self._autopilot.on_frame)
-                except TypeError:
-                    pass
-            stopped = self._video_thread.stop()
-            if stopped:
-                self._video_thread = None
-            else:
-                self._set_status(
-                    "Відеопотік не завершився коректно. "
-                    "Потік залишено активним до завершення.",
-                    level="WARNING",
-                )
+    def _stop_video(self) -> bool:
+        """Зупинити MJPEG-потік і повернути placeholder відео.
+
+        Повертає True якщо потік зупинився або ніколи не існував,
+        False якщо потік не встиг зупинитись за 3 секунди і залишається активним.
+        """
+        if self._video_thread is None:
+            # Поток вже відсутній — повертаємо успіх.
+            self.video_label.setPixmap(QPixmap())
+            self.video_label.setText(VIDEO_PLACEHOLDER_TEXT)
+            return True
+
+        # Відписуємо автопілот, якщо він прив'язаний.
+        if self._autopilot is not None:
+            try:
+                self._video_thread.cv_frame_ready.disconnect(self._autopilot.on_frame)
+            except TypeError:
+                pass
+
+        stopped = self._video_thread.stop()
+        if stopped:
+            self._video_thread = None
+        else:
+            self._set_status(
+                "Відеопотік не завершився коректно. "
+                "Потік залишено активним до завершення.",
+                level="WARNING",
+            )
 
         # Після stop завжди очищаємо QLabel.
         self.video_label.setPixmap(QPixmap())
         self.video_label.setText(VIDEO_PLACEHOLDER_TEXT)
+        return stopped
 
     def _update_video_frame(self, image: QImage) -> None:
         """Показати отриманий кадр у QLabel з масштабуванням."""
@@ -1253,6 +1282,22 @@ class MainWindow(QMainWindow):
         """Оновити діапазон для поточного кольору з UI та оновити конфіг автопілота."""
         name = self._current_color_name
         lower, upper = self._read_hsv_from_ui()
+
+        # Валідація: мін не може перевищувати макс для жодного каналу.
+        channel_names = ("H", "S", "V")
+        invalid = [
+            f"{ch}({lo}>{hi})"
+            for ch, lo, hi in zip(channel_names, lower, upper)
+            if lo > hi
+        ]
+        if invalid:
+            self._set_status(
+                f"Помилка HSV: мінімум перевищує максимум для каналів: {', '.join(invalid)}. "
+                "Виправте значення та повторіть.",
+                level="WARNING",
+            )
+            return
+
         self._color_ranges[name] = ColorRange(name=name, lower=lower, upper=upper)
         self._set_status(
             f"Оновлено HSV-діапазон для кольору {name}: "
@@ -1449,8 +1494,6 @@ class MainWindow(QMainWindow):
         if not self._autopilot_enabled:
             return pixmap
 
-        import numpy as np
-
         image = pixmap.toImage().convertToFormat(QImage.Format_RGB888)
         width, height = image.width(), image.height()
         bytes_per_line = image.bytesPerLine()
@@ -1463,34 +1506,43 @@ class MainWindow(QMainWindow):
             mask = self._autopilot_mask
             if isinstance(mask, np.ndarray) and mask.shape == (height, width):
                 selected = mask > 0
-                rgb[selected, 0] = np.clip(rgb[selected, 0] * 0.35 + 255 * 0.65, 0, 255)
-                rgb[selected, 1] = (rgb[selected, 1] * 0.35).astype(np.uint8)
-                rgb[selected, 2] = (rgb[selected, 2] * 0.35).astype(np.uint8)
+                # Усі три канали обробляються однаково: clip запобігає переповнення float,
+                # astype(uint8) гарантує повернення правильного типу назад у rgb.
+                rgb[selected, 0] = np.clip(
+                    rgb[selected, 0] * 0.35 + 255 * 0.65, 0, 255
+                ).astype(np.uint8)
+                rgb[selected, 1] = np.clip(
+                    rgb[selected, 1] * 0.35, 0, 255
+                ).astype(np.uint8)
+                rgb[selected, 2] = np.clip(
+                    rgb[selected, 2] * 0.35, 0, 255
+                ).astype(np.uint8)
 
         overlay = QPixmap.fromImage(
             QImage(rgb.data, width, height, width * 3, QImage.Format_RGB888).copy()
         )
         painter = QPainter(overlay)
+        try:
+            if self._autopilot_target is not None:
+                target = self._autopilot_target
+                pin_state = target.get("pin_state", "")
+                if pin_state == "ram":
+                    color = QColor(255, 80, 80)
+                elif target.get("confirmed", True):
+                    color = QColor(0, 255, 0)
+                else:
+                    color = QColor(255, 165, 0)
+                pen = QPen(color)
+                pen.setWidth(max(2, overlay.width() // 200))
+                painter.setPen(pen)
+                painter.drawRect(target["x"], target["y"], target["w"], target["h"])
 
-        if self._autopilot_target is not None:
-            target = self._autopilot_target
-            pin_state = target.get("pin_state", "")
-            if pin_state == "ram":
-                color = QColor(255, 80, 80)
-            elif target.get("confirmed", True):
-                color = QColor(0, 255, 0)
-            else:
-                color = QColor(255, 165, 0)
-            pen = QPen(color)
-            pen.setWidth(max(2, overlay.width() // 200))
-            painter.setPen(pen)
-            painter.drawRect(target["x"], target["y"], target["w"], target["h"])
-
-            center_pen = QPen(QColor(255, 255, 0))
-            center_pen.setWidth(max(1, overlay.width() // 320))
-            painter.setPen(center_pen)
-            frame_center = overlay.width() // 2
-            painter.drawLine(frame_center, 0, frame_center, overlay.height())
-
-        painter.end()
+                center_pen = QPen(QColor(255, 255, 0))
+                center_pen.setWidth(max(1, overlay.width() // 320))
+                painter.setPen(center_pen)
+                frame_center = overlay.width() // 2
+                painter.drawLine(frame_center, 0, frame_center, overlay.height())
+        finally:
+            # painter.end() мусить викликатись завжди, навіть якщо виникне KeyError або інший виняток.
+            painter.end()
         return overlay

@@ -9,6 +9,14 @@ from dataclasses import dataclass
 from config.settings import DISCOVERY_PORT, DISCOVERY_SIGNATURE, DISCOVERY_TIMEOUT_SECONDS
 
 
+__all__ = [
+    "RobotDiscoveryResult",
+    "RobotDiscoveryError",
+    "discover_robots",
+    "discover_robot",
+]
+
+
 class RobotDiscoveryError(RuntimeError):
     """Помилка некоректного discovery-повідомлення."""
 
@@ -37,6 +45,8 @@ def discover_robots(timeout: float = DISCOVERY_TIMEOUT_SECONDS) -> list[RobotDis
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(0.5)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # SO_BROADCAST обов'язковий для отримання broadcast UDP-пакетів на деяких ОС.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
     # Словник одночасно зберігає результат і прибирає дублікати за robot_id.
     robots: dict[str, RobotDiscoveryResult] = {}

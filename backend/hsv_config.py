@@ -9,6 +9,12 @@ from typing import Dict, Iterable
 
 from config.settings import DEFAULT_COLOR_HSV_RANGES, HSV_CONFIG_FILENAME
 
+__all__ = [
+    "ColorRange",
+    "load_color_ranges",
+    "save_color_ranges",
+]
+
 
 @dataclass
 class ColorRange:
@@ -44,9 +50,17 @@ def load_color_ranges() -> Dict[str, ColorRange]:
         result: Dict[str, ColorRange] = {}
         for item in data.get("colors", []):
             name = str(item["name"])
-            lower = tuple(int(x) for x in item["lower"])
-            upper = tuple(int(x) for x in item["upper"])
-            if len(lower) != 3 or len(upper) != 3:
+            raw_lower = tuple(int(x) for x in item["lower"])
+            raw_upper = tuple(int(x) for x in item["upper"])
+            if len(raw_lower) != 3 or len(raw_upper) != 3:
+                continue
+            # H: 0–179, S і V: 0–255 — відповідно до діапазонів OpenCV.
+            h_max, sv_max = 179, 255
+            limits = ((0, h_max), (0, sv_max), (0, sv_max))
+            lower = tuple(max(lo, min(hi, v)) for (lo, hi), v in zip(limits, raw_lower))
+            upper = tuple(max(lo, min(hi, v)) for (lo, hi), v in zip(limits, raw_upper))
+            # Пропускаємо запис якщо після затискання мін перевищує макс.
+            if any(lo > hi for lo, hi in zip(lower, upper)):
                 continue
             result[name] = ColorRange(name=name, lower=lower, upper=upper)
         if not result:

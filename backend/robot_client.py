@@ -29,8 +29,9 @@ from config.settings import (
 # Команди руху обмежені поточним WebSocket API прошивки.
 VALID_MOTION_COMMANDS: Final[set[str]] = {"forward", "backward", "left", "right", "stop"}
 
-# Команди руху не повторюються автоматично, щоб не продовжити рух після збою зв’язку.
-CRITICAL_MOTION_COMMANDS: Final[set[str]] = {"forward", "backward", "left", "right", "stop"}
+# Команди напрямку не повторюються, щоб не продовжити рух після збою зв'язку.
+# "stop" відсутній у цьому наборі навмисно: зупинку потрібно дати 2 спроби (некритична поведінка).
+CRITICAL_MOTION_COMMANDS: Final[set[str]] = {"forward", "backward", "left", "right"}
 
 # Ці помилки означають, що socket можна закрити і для некритичної команди спробувати ще раз.
 RECOVERABLE_WS_ERRORS: Final[tuple[type[BaseException], ...]] = (
@@ -40,6 +41,13 @@ RECOVERABLE_WS_ERRORS: Final[tuple[type[BaseException], ...]] = (
     OSError,
     TimeoutError,
 )
+
+__all__ = [
+    "RobotClient",
+    "RobotClientError",
+    "RobotCommandResult",
+    "VALID_MOTION_COMMANDS",
+]
 
 
 class RobotClientError(RuntimeError):
@@ -224,7 +232,9 @@ class RobotClient:
 
         try:
             requests.get(
-                f"http://{self._host}:{DEFAULT_WS_PORT}{DEFAULT_ACTION_PATH}",
+                # Використовуємо self._command_port, а не DEFAULT_WS_PORT,
+                # щоб fallback працював і при нестандартному порті.
+                f"http://{self._host}:{self._command_port}{DEFAULT_ACTION_PATH}",
                 params={"go": "stop"},
                 timeout=(0.5, 0.5),
             )

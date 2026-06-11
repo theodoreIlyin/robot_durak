@@ -16,6 +16,12 @@ try:
 except Exception:  # noqa: BLE001
     YOLO = None
 
+__all__ = [
+    "AutoPilotConfig",
+    "ColorFollowAutoPilot",
+    "PinMissionState",
+]
+
 
 class PinMissionState(str, Enum):
     SEEK = "seek"
@@ -50,7 +56,8 @@ class AutoPilotConfig:
     detector_enabled: bool = False
     detector_model: str = "yolov8n.pt"
     detector_img_size: int = 416
-    detector_target_classes: Sequence[str] = field(default_factory=tuple)
+    # list — стандартний патерн для mutable default у dataclass.
+    detector_target_classes: Sequence[str] = field(default_factory=list)
 
     center_dead_zone: float = 0.18
     too_close_area_ratio: float = 0.28
@@ -140,6 +147,9 @@ class ColorFollowAutoPilot(QObject):
 
     @pyqtSlot(object)
     def on_frame(self, frame: np.ndarray) -> None:
+        # Захист від ZeroDivisionError при frame_skip <= 0.
+        if self._cfg.frame_skip <= 0:
+            return
         self._frame_counter += 1
         if self._frame_counter % self._cfg.frame_skip != 0:
             return
@@ -340,7 +350,8 @@ class ColorFollowAutoPilot(QObject):
                 self._emit_mission_status("Збивання кеглі!")
                 return "forward", ram_target, preview_mask
 
-            self._close_lost_frames += 1
+            # _close_lost_frames вже збільшено у _check_pin_knocked() вище,
+            # тому тут додатковий інкремент не потрібен (він призводив до подвоєння).
             if self._close_tracking and self._close_lost_frames >= self._cfg.knock_lost_frames:
                 self._register_knocked_pin(frame_w, frame_h)
                 self._begin_backup(now)
@@ -536,7 +547,9 @@ class ColorFollowAutoPilot(QObject):
             if box_area <= 0:
                 continue
 
-            area_ratio = box_area / frame_area
+            # area_ratio базується на реальній площі контуру (а не bounding box),
+            # щоб пороги too_close_area_ratio та hit_area_ratio були узгоджені з area.
+            area_ratio = area / frame_area
             aspect = max(w_box / max(h_box, 1), h_box / max(w_box, 1))
             if aspect > self._cfg.max_aspect_ratio:
                 continue

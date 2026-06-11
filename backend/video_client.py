@@ -15,6 +15,10 @@ from config.settings import DEFAULT_STREAM_PATH, DEFAULT_STREAM_PORT, VIDEO_RECO
 # Запобіжник від накопичення пошкодженого або надто великого MJPEG-кадру в пам’яті.
 MAX_MJPEG_FRAME_BYTES = 2 * 1024 * 1024
 
+__all__ = [
+    "VideoStreamThread",
+]
+
 
 def _extract_content_length(header: bytes) -> int | None:
     """Дістати Content-Length із заголовка MJPEG-частини."""

@@ -3,4 +3,4 @@ requests>=2.31.0,<3
 websocket-client>=1.8.0,<2
 opencv-python>=4.9.0.80,<5
 numpy>=1.26.0,<3
-ultralytics>=8.0.0
+ultralytics>=8.0.0,<9

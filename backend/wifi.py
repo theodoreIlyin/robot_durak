@@ -14,6 +14,12 @@ from config.settings import (
 )
 
 
+__all__ = [
+    "WifiProvisioningClient",
+    "WifiProvisioningError",
+]
+
+
 class WifiProvisioningError(RuntimeError):
     """Помилка передавання Wi-Fi налаштувань до ESP32-CAM."""
 
@@ -76,15 +82,17 @@ class WifiProvisioningClient:
 
     @staticmethod
     def _normalize_host(host: str) -> str:
-        """Очистити адресу setup-вузла від схеми та шляху."""
+        """Очистити адресу setup-вузла від схеми, порту та шляху."""
 
-        # Користувач може вставити http://192.168.4.1/wifi; клієнту потрібен тільки host.
+        # Користувач може вставити http://192.168.4.1:80/wifi; клієнту потрібен тільки host.
         clean_host = host.strip()
         if not clean_host:
             raise ValueError("Setup host cannot be empty.")
         if "://" in clean_host:
             parsed = urlsplit(clean_host)
-            clean_host = parsed.netloc or parsed.path
+            # parsed.hostname видаляє порт автоматично (на відміну від parsed.netloc,
+            # який зберігає рядок разом з портом і призводить до URL виду host:80:80).
+            clean_host = parsed.hostname or parsed.path
         clean_host = clean_host.split("/", 1)[0].strip()
         if not clean_host:
             raise ValueError("Setup host cannot be empty.")
