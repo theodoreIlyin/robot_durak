@@ -59,17 +59,17 @@ class AutoPilotConfig:
     # list — стандартний патерн для mutable default у dataclass.
     detector_target_classes: Sequence[str] = field(default_factory=list)
 
-    center_dead_zone: float = 0.18
+    center_dead_zone: float = 0.10   # зменшено 0.18→0.10: точніше наведення, менше виляння
     too_close_area_ratio: float = 0.28
 
     # Режим збивання кегель
     pin_mode_enabled: bool = False
     standing_height_ratio: float = 1.1   # h/w: стояча кегля вища за широку
-    hit_area_ratio: float = 0.10         # почати таран, коли кегля велика в кадрі
+    hit_area_ratio: float = 0.06         # почати таран, коли кегля велика в кадрі (0.06 → раніше, з більшої відстані)
     knocked_zone_radius: float = 0.18    # нормалізований радіус «вже збито»
-    knock_lost_frames: int = 3           # кадрів без стоячої цілі після зближення
-    action_seconds: float = 5.0        # кожна дія (назад, огляд, пауза) = 5 с
-    max_ram_seconds: float = 1.4
+    knock_lost_frames: int = 5           # кадрів без стоячої цілі після зближення (5 → менше хибних спрацьовувань)
+    action_seconds: float = 3.0          # кожна дія (назад, огляд, пауза) = 3 с (швидше пошук)
+    max_ram_seconds: float = 2.5         # тривалість удару: 2.5 с достатньо для надійного збиття
 
 
 class ColorFollowAutoPilot(QObject):
