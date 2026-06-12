@@ -61,8 +61,11 @@ class AutoPilotConfig:
 
     center_dead_zone: float = 0.10   # зменшено 0.18→0.10: точніше наведення, менше виляння
     steering_hysteresis: float = 0.035
+    turn_pulse_seconds: float = 0.18
+    turn_settle_seconds: float = 0.16
     target_smoothing: float = 0.35
     target_memory_seconds: float = 0.45
+    target_lost_scan_delay: float = 0.9
     too_close_area_ratio: float = 0.28
 
     # Режим збивання кегель
@@ -72,6 +75,8 @@ class AutoPilotConfig:
     knocked_zone_radius: float = 0.18    # нормалізований радіус «вже збито»
     knock_lost_frames: int = 5           # кадрів без стоячої цілі після зближення (5 → менше хибних спрацьовувань)
     action_seconds: float = 3.0          # кожна дія (назад, огляд, пауза) = 3 с (швидше пошук)
+    scan_seconds: float = 0.8
+    scan_pause_seconds: float = 0.45
     max_ram_seconds: float = 2.5         # тривалість удару: 2.5 с достатньо для надійного збиття
 
 
@@ -93,6 +98,9 @@ class ColorFollowAutoPilot(QObject):
         self._last_command: Optional[str] = None
         self._lost_frames = 0
         self._last_steering_command: Optional[str] = None
+        self._active_turn_command: Optional[str] = None
+        self._turn_pulse_until = 0.0
+        self._turn_settle_until = 0.0
         self._smoothed_target: Optional[dict] = None
         self._last_target_seen_at = 0.0
 
@@ -178,6 +186,9 @@ class ColorFollowAutoPilot(QObject):
 
     def _reset_visual_tracking(self) -> None:
         self._last_steering_command = None
+        self._active_turn_command = None
+        self._turn_pulse_until = 0.0
+        self._turn_settle_until = 0.0
         self._smoothed_target = None
         self._last_target_seen_at = 0.0
 
@@ -204,7 +215,8 @@ class ColorFollowAutoPilot(QObject):
         if command == "stop":
             self._lost_frames += 1
             if (
-                self._lost_frames < self._cfg.lost_frames_threshold
+                target is None
+                and self._lost_frames < self._cfg.lost_frames_threshold
                 and self._last_command is not None
                 and self._last_command != "stop"
             ):
@@ -393,6 +405,11 @@ class ColorFollowAutoPilot(QObject):
         if not standing:
             self._close_tracking = False
             self._close_lost_frames = 0
+            if self._recently_saw_target(now):
+                self._last_steering_command = None
+                self._active_turn_command = None
+                self._emit_mission_status("Кеглю тимчасово втрачено — зупинка")
+                return "stop", self._smoothed_target, preview_mask
             self._begin_scan_left(now)
             return "left", None, preview_mask
 
@@ -424,28 +441,60 @@ class ColorFollowAutoPilot(QObject):
 
         if self._last_steering_command == "left":
             if dx < -release:
-                command = "left"
+                turn_command = "left"
             elif dx > engage:
-                command = "right"
+                turn_command = "right"
             else:
-                command = "forward"
+                turn_command = None
         elif self._last_steering_command == "right":
             if dx > release:
-                command = "right"
+                turn_command = "right"
             elif dx < -engage:
-                command = "left"
+                turn_command = "left"
             else:
-                command = "forward"
+                turn_command = None
         else:
             if dx > engage:
-                command = "right"
+                turn_command = "right"
             elif dx < -engage:
-                command = "left"
+                turn_command = "left"
             else:
-                command = "forward"
+                turn_command = None
 
-        self._last_steering_command = command
-        return command
+        if turn_command is None:
+            self._last_steering_command = "forward"
+            self._active_turn_command = None
+            self._turn_pulse_until = 0.0
+            self._turn_settle_until = 0.0
+            return "forward"
+
+        return self._pulse_turn(turn_command)
+
+    def _pulse_turn(self, command: str) -> str:
+        now = time.monotonic()
+        if (
+            self._active_turn_command != command
+            or now >= self._turn_settle_until
+        ):
+            self._active_turn_command = command
+            self._turn_pulse_until = now + max(0.05, self._cfg.turn_pulse_seconds)
+            self._turn_settle_until = self._turn_pulse_until + max(
+                0.0,
+                self._cfg.turn_settle_seconds,
+            )
+
+        if now < self._turn_pulse_until:
+            self._last_steering_command = command
+            return command
+
+        self._last_steering_command = None
+        return "stop"
+
+    def _recently_saw_target(self, now: float) -> bool:
+        if self._smoothed_target is None or self._last_target_seen_at <= 0.0:
+            return False
+        delay = max(self._cfg.target_memory_seconds, self._cfg.target_lost_scan_delay)
+        return now - self._last_target_seen_at <= delay
 
     def _select_target(self, candidates: list[dict], frame_w: int, frame_h: int) -> dict:
         return dict(
@@ -574,6 +623,12 @@ class ColorFollowAutoPilot(QObject):
     def _action_duration(self) -> float:
         return self._cfg.action_seconds
 
+    def _scan_duration(self) -> float:
+        return self._cfg.scan_seconds
+
+    def _scan_pause_duration(self) -> float:
+        return self._cfg.scan_pause_seconds
+
     def _begin_backup(self, now: float) -> None:
         self._pin_state = PinMissionState.BACKUP
         self._state_until = now + self._action_duration()
@@ -585,36 +640,36 @@ class ColorFollowAutoPilot(QObject):
 
     def _begin_scan_left(self, now: float) -> None:
         self._pin_state = PinMissionState.SCAN_LEFT
-        self._state_until = now + self._action_duration()
+        self._state_until = now + self._scan_duration()
         self._last_command = None
         self._reset_visual_tracking()
         self._emit_mission_status(
-            f"Огляд ліворуч {self._action_duration():.0f} с "
+            f"Огляд ліворуч {self._scan_duration():.1f} с "
             f"(збито: {self._pins_knocked})"
         )
 
     def _begin_scan_pause(self, now: float, after: str) -> None:
         self._pin_state = PinMissionState.SCAN_PAUSE
-        self._state_until = now + self._action_duration()
+        self._state_until = now + self._scan_pause_duration()
         self._scan_pause_after = after
         self._last_command = None
         self._last_steering_command = None
         if after == "right":
             self._emit_mission_status(
-                f"Стоп {self._action_duration():.0f} с — потім огляд праворуч"
+                f"Стоп {self._scan_pause_duration():.1f} с — потім огляд праворуч"
             )
         else:
             self._emit_mission_status(
-                f"Стоп {self._action_duration():.0f} с — шукаю наступну кеглю"
+                f"Стоп {self._scan_pause_duration():.1f} с — шукаю наступну кеглю"
             )
 
     def _begin_scan_right(self, now: float) -> None:
         self._pin_state = PinMissionState.SCAN_RIGHT
-        self._state_until = now + self._action_duration()
+        self._state_until = now + self._scan_duration()
         self._last_command = None
         self._reset_visual_tracking()
         self._emit_mission_status(
-            f"Огляд праворуч {self._action_duration():.0f} с"
+            f"Огляд праворуч {self._scan_duration():.1f} с"
         )
 
     def _on_pin_found_during_scan(self) -> None:
