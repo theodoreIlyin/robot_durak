@@ -60,6 +60,9 @@ class AutoPilotConfig:
     detector_target_classes: Sequence[str] = field(default_factory=list)
 
     center_dead_zone: float = 0.10   # зменшено 0.18→0.10: точніше наведення, менше виляння
+    steering_hysteresis: float = 0.035
+    target_smoothing: float = 0.35
+    target_memory_seconds: float = 0.45
     too_close_area_ratio: float = 0.28
 
     # Режим збивання кегель
@@ -89,6 +92,9 @@ class ColorFollowAutoPilot(QObject):
         self._frame_counter = 0
         self._last_command: Optional[str] = None
         self._lost_frames = 0
+        self._last_steering_command: Optional[str] = None
+        self._smoothed_target: Optional[dict] = None
+        self._last_target_seen_at = 0.0
 
         self._pin_state = PinMissionState.SEEK
         self._state_until = 0.0
@@ -124,6 +130,7 @@ class ColorFollowAutoPilot(QObject):
         self._timer.stop()
         self._last_command = None
         self._lost_frames = 0
+        self._reset_visual_tracking()
         self._reset_pin_mission()
         self.target_detected.emit(None)
         self.command_ready.emit("stop")
@@ -134,6 +141,7 @@ class ColorFollowAutoPilot(QObject):
         if pin_mode_changed:
             self._reset_pin_mission()
             self._last_command = None
+        self._reset_visual_tracking()
         if self._cfg.detector_enabled and YOLO is not None and not self._detector_available:
             try:
                 self._detector = YOLO(self._cfg.detector_model)
@@ -167,6 +175,11 @@ class ColorFollowAutoPilot(QObject):
         self._last_close_target = None
         self._last_mission_status = ""
         self._scan_pause_after = "right"
+
+    def _reset_visual_tracking(self) -> None:
+        self._last_steering_command = None
+        self._smoothed_target = None
+        self._last_target_seen_at = 0.0
 
     def _emit_mission_status(self, text: str) -> None:
         if text == self._last_mission_status:
@@ -202,6 +215,8 @@ class ColorFollowAutoPilot(QObject):
         if command == self._last_command:
             return
 
+        if command == "stop":
+            self._last_steering_command = None
         self._last_command = command
         self.command_ready.emit(command)
 
@@ -215,9 +230,11 @@ class ColorFollowAutoPilot(QObject):
             upper2 = np.array(self._cfg.secondary_upper_hsv, dtype=np.uint8)
             mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lower2, upper2))
 
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.medianBlur(mask, 3)
+        open_kernel = np.ones((3, 3), np.uint8)
+        close_kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
         return mask
 
     def _full_frame_mask(self, roi_mask: np.ndarray, roi_top: int, frame_shape: tuple[int, int, int]) -> np.ndarray:
@@ -258,8 +275,8 @@ class ColorFollowAutoPilot(QObject):
         if not candidates:
             return "stop", None, preview_mask
 
-        candidates.sort(key=lambda c: c["area"], reverse=True)
-        target = dict(candidates[0])
+        target = self._select_target(candidates, frame.shape[1], frame.shape[0])
+        target = self._stabilize_target(target, frame.shape[1], frame.shape[0])
         target["confirmed"] = True
 
         if self._cfg.detector_enabled and self._detector_available:
@@ -286,7 +303,10 @@ class ColorFollowAutoPilot(QObject):
 
         standing = self._standing_pins(candidates)
         standing = [c for c in standing if not self._in_knocked_zone(c, frame_w, frame_h)]
-        standing.sort(key=lambda c: (c["area"], -abs(c["cx"] - frame_w / 2)), reverse=True)
+        standing.sort(
+            key=lambda c: self._target_priority(c, frame_w, frame_h),
+            reverse=True,
+        )
 
         target = dict(standing[0]) if standing else None
         if target is not None:
@@ -308,7 +328,10 @@ class ColorFollowAutoPilot(QObject):
         if self._pin_state == PinMissionState.SCAN_LEFT:
             if standing:
                 self._on_pin_found_during_scan()
-                return self._approach_found_pin(standing[0], frame_w, target, preview_mask)
+                found = self._stabilize_target(standing[0], frame_w, frame_h)
+                found["confirmed"] = True
+                found["pin_state"] = "standing"
+                return self._approach_found_pin(found, frame_w, found, preview_mask)
             if now < self._state_until:
                 return "left", None, preview_mask
             self._begin_scan_pause(now, after="right")
@@ -317,7 +340,10 @@ class ColorFollowAutoPilot(QObject):
         if self._pin_state == PinMissionState.SCAN_PAUSE:
             if standing:
                 self._on_pin_found_during_scan()
-                return self._approach_found_pin(standing[0], frame_w, target, preview_mask)
+                found = self._stabilize_target(standing[0], frame_w, frame_h)
+                found["confirmed"] = True
+                found["pin_state"] = "standing"
+                return self._approach_found_pin(found, frame_w, found, preview_mask)
             if now < self._state_until:
                 return "stop", None, preview_mask
             if self._scan_pause_after == "right":
@@ -329,7 +355,10 @@ class ColorFollowAutoPilot(QObject):
         if self._pin_state == PinMissionState.SCAN_RIGHT:
             if standing:
                 self._on_pin_found_during_scan()
-                return self._approach_found_pin(standing[0], frame_w, target, preview_mask)
+                found = self._stabilize_target(standing[0], frame_w, frame_h)
+                found["confirmed"] = True
+                found["pin_state"] = "standing"
+                return self._approach_found_pin(found, frame_w, found, preview_mask)
             if now < self._state_until:
                 return "right", None, preview_mask
             self._begin_scan_pause(now, after="finish")
@@ -368,6 +397,7 @@ class ColorFollowAutoPilot(QObject):
             return "left", None, preview_mask
 
         seek_target = standing[0]
+        seek_target = self._stabilize_target(seek_target, frame_w, frame_h)
         self._track_close_approach(seek_target)
 
         if seek_target["area_ratio"] >= self._cfg.hit_area_ratio:
@@ -382,16 +412,95 @@ class ColorFollowAutoPilot(QObject):
         self._emit_mission_status(
             f"Їду до кеглі ({self._pins_knocked} вже збито)"
         )
-        return self._steer_toward(seek_target, frame_w), target, preview_mask
+        return self._steer_toward(seek_target, frame_w), seek_target, preview_mask
 
     def _steer_toward(self, target: dict, frame_w: int) -> str:
         center_x = frame_w / 2.0
         dx = (target["cx"] - center_x) / center_x
-        if dx > self._cfg.center_dead_zone:
-            return "right"
-        if dx < -self._cfg.center_dead_zone:
-            return "left"
-        return "forward"
+        dead_zone = max(0.0, self._cfg.center_dead_zone)
+        hysteresis = max(0.0, self._cfg.steering_hysteresis)
+        engage = dead_zone + hysteresis
+        release = max(0.0, dead_zone - hysteresis)
+
+        if self._last_steering_command == "left":
+            if dx < -release:
+                command = "left"
+            elif dx > engage:
+                command = "right"
+            else:
+                command = "forward"
+        elif self._last_steering_command == "right":
+            if dx > release:
+                command = "right"
+            elif dx < -engage:
+                command = "left"
+            else:
+                command = "forward"
+        else:
+            if dx > engage:
+                command = "right"
+            elif dx < -engage:
+                command = "left"
+            else:
+                command = "forward"
+
+        self._last_steering_command = command
+        return command
+
+    def _select_target(self, candidates: list[dict], frame_w: int, frame_h: int) -> dict:
+        return dict(
+            max(
+                candidates,
+                key=lambda c: self._target_priority(c, frame_w, frame_h),
+            )
+        )
+
+    def _target_priority(self, candidate: dict, frame_w: int, frame_h: int) -> float:
+        center_x = frame_w / 2.0
+        center_score = 1.0 - min(abs(candidate["cx"] - center_x) / max(center_x, 1.0), 1.0)
+        score = float(candidate["area"]) * (1.0 + 0.25 * center_score)
+
+        if (
+            self._smoothed_target is not None
+            and time.monotonic() - self._last_target_seen_at <= self._cfg.target_memory_seconds
+        ):
+            dx = (candidate["cx"] - self._smoothed_target["cx"]) / max(frame_w, 1)
+            dy = (candidate["cy"] - self._smoothed_target["cy"]) / max(frame_h, 1)
+            distance = (dx * dx + dy * dy) ** 0.5
+            continuity = max(0.0, 1.0 - distance / 0.25)
+            score *= 1.0 + 0.45 * continuity
+
+        return score
+
+    def _stabilize_target(self, target: dict, frame_w: int, frame_h: int) -> dict:
+        now = time.monotonic()
+        alpha = min(max(self._cfg.target_smoothing, 0.0), 1.0)
+        previous = self._smoothed_target
+
+        if previous is None or now - self._last_target_seen_at > self._cfg.target_memory_seconds:
+            stable = dict(target)
+        else:
+            dx = (target["cx"] - previous["cx"]) / max(frame_w, 1)
+            dy = (target["cy"] - previous["cy"]) / max(frame_h, 1)
+            distance = (dx * dx + dy * dy) ** 0.5
+            if distance > 0.35:
+                stable = dict(target)
+            else:
+                stable = dict(target)
+                for key in ("cx", "cy", "area", "area_ratio"):
+                    stable[key] = previous[key] * (1.0 - alpha) + target[key] * alpha
+                stable["w"] = int(round(previous["w"] * (1.0 - alpha) + target["w"] * alpha))
+                stable["h"] = int(round(previous["h"] * (1.0 - alpha) + target["h"] * alpha))
+                stable["x"] = int(round(stable["cx"] - stable["w"] / 2.0))
+                stable["y"] = int(round(stable["cy"] - stable["h"] / 2.0))
+
+        stable["x"] = max(0, min(int(round(stable["x"])), max(frame_w - 1, 0)))
+        stable["y"] = max(0, min(int(round(stable["y"])), max(frame_h - 1, 0)))
+        stable["w"] = max(1, min(int(round(stable["w"])), max(frame_w - stable["x"], 1)))
+        stable["h"] = max(1, min(int(round(stable["h"])), max(frame_h - stable["y"], 1)))
+        self._smoothed_target = dict(stable)
+        self._last_target_seen_at = now
+        return stable
 
     def _is_standing_pin(self, candidate: dict) -> bool:
         return candidate["h"] >= candidate["w"] * self._cfg.standing_height_ratio
@@ -469,6 +578,7 @@ class ColorFollowAutoPilot(QObject):
         self._pin_state = PinMissionState.BACKUP
         self._state_until = now + self._action_duration()
         self._last_command = None
+        self._reset_visual_tracking()
         self._emit_mission_status(
             f"Їду назад {self._action_duration():.0f} с після збиття"
         )
@@ -477,6 +587,7 @@ class ColorFollowAutoPilot(QObject):
         self._pin_state = PinMissionState.SCAN_LEFT
         self._state_until = now + self._action_duration()
         self._last_command = None
+        self._reset_visual_tracking()
         self._emit_mission_status(
             f"Огляд ліворуч {self._action_duration():.0f} с "
             f"(збито: {self._pins_knocked})"
@@ -487,6 +598,7 @@ class ColorFollowAutoPilot(QObject):
         self._state_until = now + self._action_duration()
         self._scan_pause_after = after
         self._last_command = None
+        self._last_steering_command = None
         if after == "right":
             self._emit_mission_status(
                 f"Стоп {self._action_duration():.0f} с — потім огляд праворуч"
@@ -500,6 +612,7 @@ class ColorFollowAutoPilot(QObject):
         self._pin_state = PinMissionState.SCAN_RIGHT
         self._state_until = now + self._action_duration()
         self._last_command = None
+        self._reset_visual_tracking()
         self._emit_mission_status(
             f"Огляд праворуч {self._action_duration():.0f} с"
         )
@@ -508,6 +621,7 @@ class ColorFollowAutoPilot(QObject):
         self._pin_state = PinMissionState.SEEK
         self._close_tracking = False
         self._last_command = None
+        self._last_steering_command = None
 
     def _approach_found_pin(
         self,
@@ -566,23 +680,24 @@ class ColorFollowAutoPilot(QObject):
                 ):
                     continue
 
-            candidates.append(
-                {
-                    "x": x,
-                    "y": y_full,
-                    "w": w_box,
-                    "h": h_box,
-                    "cx": x + w_box / 2.0,
-                    "cy": y_full + h_box / 2.0,
-                    "area": area,
-                    "area_ratio": area_ratio,
-                }
-            )
+            candidate = {
+                "x": x,
+                "y": y_full,
+                "w": w_box,
+                "h": h_box,
+                "cx": x + w_box / 2.0,
+                "cy": y_full + h_box / 2.0,
+                "area": area,
+                "area_ratio": area_ratio,
+            }
+            if self._cfg.shape_filter_enabled:
+                candidate["circularity"] = circularity
+                candidate["rectangularity"] = rectangularity
+            candidates.append(candidate)
 
-            if len(candidates) >= self._cfg.max_candidates:
-                break
-
-        return candidates
+        candidates.sort(key=lambda c: c["area"], reverse=True)
+        max_candidates = max(1, self._cfg.max_candidates)
+        return candidates[:max_candidates]
 
     def _validate_with_detector(self, frame: np.ndarray, target: dict) -> bool:
         if not self._detector_available or self._detector is None:
