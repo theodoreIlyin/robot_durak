@@ -59,10 +59,10 @@ class AutoPilotConfig:
     # list — стандартний патерн для mutable default у dataclass.
     detector_target_classes: Sequence[str] = field(default_factory=list)
 
-    center_dead_zone: float = 0.10   # зменшено 0.18→0.10: точніше наведення, менше виляння
-    steering_hysteresis: float = 0.035
-    turn_pulse_seconds: float = 0.18
-    turn_settle_seconds: float = 0.16
+    center_dead_zone: float = 0.18
+    steering_hysteresis: float = 0.04
+    turn_pulse_seconds: float = 0.12
+    turn_settle_seconds: float = 0.28
     target_smoothing: float = 0.35
     target_memory_seconds: float = 0.45
     target_lost_scan_delay: float = 0.9
@@ -71,12 +71,14 @@ class AutoPilotConfig:
     # Режим збивання кегель
     pin_mode_enabled: bool = False
     standing_height_ratio: float = 1.1   # h/w: стояча кегля вища за широку
+    min_pin_area_ratio: float = 0.0012
     hit_area_ratio: float = 0.06         # почати таран, коли кегля велика в кадрі (0.06 → раніше, з більшої відстані)
+    hit_bottom_ratio: float = 0.82       # нижній край кеглі близько до низу кадру — час таранити
     knocked_zone_radius: float = 0.18    # нормалізований радіус «вже збито»
     knock_lost_frames: int = 5           # кадрів без стоячої цілі після зближення (5 → менше хибних спрацьовувань)
     action_seconds: float = 3.0          # кожна дія (назад, огляд, пауза) = 3 с (швидше пошук)
-    scan_seconds: float = 0.8
-    scan_pause_seconds: float = 0.45
+    scan_seconds: float = 0.55
+    scan_pause_seconds: float = 0.35
     max_ram_seconds: float = 2.5         # тривалість удару: 2.5 с достатньо для надійного збиття
 
 
@@ -218,7 +220,7 @@ class ColorFollowAutoPilot(QObject):
                 target is None
                 and self._lost_frames < self._cfg.lost_frames_threshold
                 and self._last_command is not None
-                and self._last_command != "stop"
+                and self._last_command == "forward"
             ):
                 return
         else:
@@ -316,7 +318,7 @@ class ColorFollowAutoPilot(QObject):
         standing = self._standing_pins(candidates)
         standing = [c for c in standing if not self._in_knocked_zone(c, frame_w, frame_h)]
         standing.sort(
-            key=lambda c: self._target_priority(c, frame_w, frame_h),
+            key=lambda c: self._pin_target_priority(c, frame_w, frame_h),
             reverse=True,
         )
 
@@ -417,9 +419,10 @@ class ColorFollowAutoPilot(QObject):
         seek_target = self._stabilize_target(seek_target, frame_w, frame_h)
         self._track_close_approach(seek_target)
 
-        if seek_target["area_ratio"] >= self._cfg.hit_area_ratio:
+        if self._should_ram_pin(seek_target, frame_w, frame_h):
             self._pin_state = PinMissionState.RAM
             self._ram_started_at = now
+            self._close_tracking = True
             self._close_lost_frames = 0
             ram_target = dict(seek_target)
             ram_target["pin_state"] = "ram"
@@ -521,6 +524,41 @@ class ColorFollowAutoPilot(QObject):
 
         return score
 
+    def _pin_target_priority(self, candidate: dict, frame_w: int, frame_h: int) -> float:
+        center_x = frame_w / 2.0
+        offset = abs(candidate["cx"] - center_x) / max(center_x, 1.0)
+        center_score = max(0.0, 1.0 - offset)
+        area_score = min(candidate["area_ratio"] / max(self._cfg.hit_area_ratio, 0.001), 1.0)
+        verticality = min(candidate["h"] / max(candidate["w"], 1), 3.0) / 3.0
+        bottom_score = min((candidate["y"] + candidate["h"]) / max(frame_h, 1), 1.0)
+
+        score = (
+            3.5 * center_score
+            + 1.0 * area_score
+            + 0.7 * verticality
+            + 0.5 * bottom_score
+        )
+
+        if (
+            self._smoothed_target is not None
+            and time.monotonic() - self._last_target_seen_at <= self._cfg.target_memory_seconds
+        ):
+            dx = (candidate["cx"] - self._smoothed_target["cx"]) / max(frame_w, 1)
+            dy = (candidate["cy"] - self._smoothed_target["cy"]) / max(frame_h, 1)
+            distance = (dx * dx + dy * dy) ** 0.5
+            score += 1.2 * max(0.0, 1.0 - distance / 0.25)
+
+        return score
+
+    def _should_ram_pin(self, target: dict, frame_w: int, frame_h: int) -> bool:
+        if target["area_ratio"] >= self._cfg.hit_area_ratio:
+            return True
+
+        center_x = frame_w / 2.0
+        offset = abs(target["cx"] - center_x) / max(center_x, 1.0)
+        bottom = (target["y"] + target["h"]) / max(frame_h, 1)
+        return bottom >= self._cfg.hit_bottom_ratio and offset <= 0.35
+
     def _stabilize_target(self, target: dict, frame_w: int, frame_h: int) -> dict:
         now = time.monotonic()
         alpha = min(max(self._cfg.target_smoothing, 0.0), 1.0)
@@ -552,6 +590,8 @@ class ColorFollowAutoPilot(QObject):
         return stable
 
     def _is_standing_pin(self, candidate: dict) -> bool:
+        if candidate["area_ratio"] < self._cfg.min_pin_area_ratio:
+            return False
         return candidate["h"] >= candidate["w"] * self._cfg.standing_height_ratio
 
     def _standing_pins(self, candidates: list[dict]) -> list[dict]:
@@ -723,17 +763,16 @@ class ColorFollowAutoPilot(QObject):
             if aspect > self._cfg.max_aspect_ratio:
                 continue
 
-            if self._cfg.shape_filter_enabled:
-                perim = float(cv2.arcLength(cnt, True))
-                if perim <= 0:
-                    continue
-                circularity = 4.0 * np.pi * area / (perim * perim)
-                rectangularity = area / box_area
-                if (
-                    circularity < self._cfg.min_circularity
-                    and rectangularity < self._cfg.min_rectangularity
-                ):
-                    continue
+            perim = float(cv2.arcLength(cnt, True))
+            if perim <= 0:
+                continue
+            circularity = 4.0 * np.pi * area / (perim * perim)
+            rectangularity = area / box_area
+            if self._cfg.shape_filter_enabled and (
+                circularity < self._cfg.min_circularity
+                and rectangularity < self._cfg.min_rectangularity
+            ):
+                continue
 
             candidate = {
                 "x": x,
@@ -745,9 +784,8 @@ class ColorFollowAutoPilot(QObject):
                 "area": area,
                 "area_ratio": area_ratio,
             }
-            if self._cfg.shape_filter_enabled:
-                candidate["circularity"] = circularity
-                candidate["rectangularity"] = rectangularity
+            candidate["circularity"] = circularity
+            candidate["rectangularity"] = rectangularity
             candidates.append(candidate)
 
         candidates.sort(key=lambda c: c["area"], reverse=True)

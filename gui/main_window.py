@@ -1334,16 +1334,17 @@ class MainWindow(QMainWindow):
             if cls.strip()
         ]
 
+        pin_mode_enabled = self.pin_mode_checkbox.isChecked()
         cfg = AutoPilotConfig(
             lower_hsv=lower,
             upper_hsv=upper,
             secondary_lower_hsv=secondary_lower,
             secondary_upper_hsv=secondary_upper,
-            shape_filter_enabled=self.shape_filter_checkbox.isChecked(),
+            shape_filter_enabled=self.shape_filter_checkbox.isChecked() or pin_mode_enabled,
             detector_enabled=detector_enabled,
             detector_target_classes=tuple(target_classes),
             mask_preview_enabled=self.mask_preview_checkbox.isChecked(),
-            pin_mode_enabled=self.pin_mode_checkbox.isChecked(),
+            pin_mode_enabled=pin_mode_enabled,
         )
         return cfg
 
@@ -1478,8 +1479,7 @@ class MainWindow(QMainWindow):
             return
 
         if command == "stop":
-            if self._active_motion_command is not None:
-                self._send_stop()
+            self._send_stop()
             return
 
         if command == self._active_motion_command:
@@ -1487,7 +1487,10 @@ class MainWindow(QMainWindow):
 
         self._active_motion_command = command
         self._send_motion(command, show_success=False)
-        self._motion_keepalive_timer.start()
+        if command in {"left", "right"}:
+            self._motion_keepalive_timer.stop()
+        else:
+            self._motion_keepalive_timer.start()
 
     def _draw_autopilot_overlay(self, pixmap: QPixmap) -> QPixmap:
         """Намалювати маску кольору, рамку цілі та лінію центру на кадрі відео."""
