@@ -153,7 +153,7 @@ class VideoStreamThread(QThread):
                 # OpenCV декодує JPEG у BGR, а QImage очікує RGB-байти.
                 frame_array = np.frombuffer(jpg, dtype=np.uint8)
                 frame = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
-                if frame is None:
+                if frame is None or frame.size == 0:
                     continue
 
                 # Спершу віддаємо сирий кадр для автопілота.

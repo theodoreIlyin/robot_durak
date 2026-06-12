@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
+import numpy as np
+import cv2
 
 from PyQt5.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QCloseEvent, QColor, QImage, QPainter, QPen, QPixmap
@@ -141,6 +143,7 @@ class MainWindow(QMainWindow):
             "orange" if "orange" in self._color_ranges else next(iter(self._color_ranges.keys()))
         )
         self._autopilot: ColorFollowAutoPilot | None = None
+        self._autopilot_thread: QThread | None = None
         self._autopilot_enabled: bool = False
         self._autopilot_target: dict | None = None
         self._autopilot_mask: object | None = None
@@ -365,7 +368,7 @@ class MainWindow(QMainWindow):
 
         # Додаткові опції фільтрації
         self.shape_filter_checkbox = QCheckBox("Фільтрація за формою")
-        self.shape_filter_checkbox.setChecked(False)
+        self.shape_filter_checkbox.setChecked(True)
         layout.addWidget(self.shape_filter_checkbox, 11, 0, 1, 3)
 
         self.detector_checkbox = QCheckBox("Детектор об'єктів (YOLO)")
@@ -716,7 +719,12 @@ class MainWindow(QMainWindow):
         if self._active_motion_command is None:
             self._motion_keepalive_timer.stop()
             return
-        self._send_motion(self._active_motion_command, show_success=False)
+            
+        speed = None
+        if self._autopilot_enabled:
+            speed = self._autopilot_speed_for_command(self._active_motion_command)
+            
+        self._send_motion(self._active_motion_command, show_success=False, speed_override=speed)
 
     def _send_motion(
         self,
@@ -1361,7 +1369,12 @@ class MainWindow(QMainWindow):
                 "Для слідкування за кольором вимкніть YOLO.",
                 level="WARNING",
             )
-        self._autopilot = ColorFollowAutoPilot(cfg, self)
+            
+        self._autopilot = ColorFollowAutoPilot(cfg, parent=None)
+        self._autopilot_thread = QThread(self)
+        self._autopilot.moveToThread(self._autopilot_thread)
+        self._autopilot_thread.start()
+        
         self._autopilot.command_ready.connect(self._on_autopilot_command)
         self._autopilot.target_detected.connect(self._on_autopilot_target)
         self._autopilot.mask_ready.connect(self._on_autopilot_mask)
@@ -1420,6 +1433,12 @@ class MainWindow(QMainWindow):
         self._autopilot_mask = None
         self._autopilot.deleteLater()
         self._autopilot = None
+        
+        if self._autopilot_thread is not None:
+            self._autopilot_thread.quit()
+            self._autopilot_thread.wait()
+            self._autopilot_thread = None
+
         self._send_stop()
 
         for button in (
@@ -1488,8 +1507,11 @@ class MainWindow(QMainWindow):
 
         speed = self._autopilot_speed_for_command(command)
         if command == self._active_motion_command:
-            # Та сама команда вже активна — keepalive її повторює, нічого не робимо
-            self._send_speed_value(speed, show_success=False)
+            # Та сама команда вже активна; keepalive її повторює.
+            # Оновлюємо швидкість ЛИШЕ якщо вона змінилась (наприклад, перехід forward → ram)
+            # — без цього _send_speed_value викликалась кожні 80 мс і засмічувала WebSocket.
+            if speed != self._last_sent_speed:
+                self._send_speed_value(speed, show_success=False)
             if not self._motion_keepalive_timer.isActive():
                 self._motion_keepalive_timer.start()
             return
@@ -1504,8 +1526,6 @@ class MainWindow(QMainWindow):
         """Намалювати маску кольору, рамку цілі та лінію центру на кадрі відео."""
         if not self._autopilot_enabled:
             return pixmap
-
-        import numpy as np
 
         image = pixmap.toImage().convertToFormat(QImage.Format_RGB888)
         width, height = image.width(), image.height()

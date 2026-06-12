@@ -27,10 +27,8 @@ from config.settings import (
 )
 
 # Команди руху обмежені поточним WebSocket API прошивки.
-VALID_MOTION_COMMANDS: Final[set[str]] = {"forward", "backward", "left", "right", "stop"}
-
 # Команди руху не повторюються автоматично, щоб не продовжити рух після збою зв’язку.
-CRITICAL_MOTION_COMMANDS: Final[set[str]] = {"forward", "backward", "left", "right", "stop"}
+VALID_MOTION_COMMANDS: Final[set[str]] = {"forward", "backward", "left", "right", "stop"}
 
 # Ці помилки означають, що socket можна закрити і для некритичної команди спробувати ще раз.
 RECOVERABLE_WS_ERRORS: Final[tuple[type[BaseException], ...]] = (
@@ -155,7 +153,10 @@ class RobotClient:
     ) -> RobotCommandResult:
         """Надіслати команду з коротким повтором для некритичних запитів."""
 
-        attempts = 1 if command in CRITICAL_MOTION_COMMANDS else 2
+        # Критичні команди руху (крім stop) не повторюються, щоб не продовжити рух після збою зв'язку.
+        # stop отримує 2 спроби — пропущена зупинка набагато небезпечніша, ніж пропущена LED-команда.
+        critical_no_retry = VALID_MOTION_COMMANDS - {"stop"}
+        attempts = 1 if command in critical_no_retry else 2
         last_error: BaseException | None = None
         for _ in range(attempts):
             try:

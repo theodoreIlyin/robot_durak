@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Iterable
@@ -52,8 +53,9 @@ def load_color_ranges() -> Dict[str, ColorRange]:
         if not result:
             raise ValueError("empty color ranges")
         return result
-    except Exception:
-        # У разі пошкодженого файла повертаємо дефолтні значення.
+    except Exception as exc:
+        logging.warning("Не вдалося завантажити HSV конфіг, використовуються дефолтні значення: %s", exc)
+        # У разі пошкодженого файла або інших помилок повертаємо дефолтні значення.
         ranges = {
             name: ColorRange(name=name, lower=tuple(defn["lower"]), upper=tuple(defn["upper"]))
             for name, defn in DEFAULT_COLOR_HSV_RANGES.items()

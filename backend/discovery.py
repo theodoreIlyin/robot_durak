@@ -37,6 +37,7 @@ def discover_robots(timeout: float = DISCOVERY_TIMEOUT_SECONDS) -> list[RobotDis
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(0.5)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
     # Словник одночасно зберігає результат і прибирає дублікати за robot_id.
     robots: dict[str, RobotDiscoveryResult] = {}

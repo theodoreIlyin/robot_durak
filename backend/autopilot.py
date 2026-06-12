@@ -44,7 +44,9 @@ class AutoPilotConfig:
 
     shape_filter_enabled: bool = True
     min_circularity: float = 0.08
-    min_rectangularity: float = 0.40
+    min_rectangularity: float = 0.18
+    min_fill_ratio: float = 0.14
+    solid_area_ratio: float = 0.35
     max_aspect_ratio: float = 4.0
     max_candidates: int = 8
 
@@ -66,6 +68,9 @@ class AutoPilotConfig:
     knocked_zone_radius: float = 0.18    # нормалізований радіус «вже збито»
     target_lock_radius: float = 0.12     # радіус утримання вже обраної цілі
     knock_lost_frames: int = 3           # кадрів без стоячої цілі після зближення
+    ram_confirm_frames: int = 3          # кадрів стабільної близької цілі перед тараном
+    ram_center_dead_zone: float = 0.30    # RAM лише коли ціль приблизно по центру
+    min_ram_seconds: float = 0.45         # мінімальний час тарану до реєстрації збиття
     # Коротший час сканування, щоб робот швидше припиняв обертання без цілі.
     action_seconds: float = 2.5
     max_ram_seconds: float = 1.4
@@ -94,12 +99,14 @@ class ColorFollowAutoPilot(QObject):
         self._knocked_zones: list[tuple[float, float]] = []
         self._pins_knocked = 0
         self._ram_started_at = 0.0
+        self._ram_candidate_frames = 0
+        self._seek_lost_frames = 0
         self._close_tracking = False
         self._close_lost_frames = 0
         self._last_close_target: Optional[dict] = None
         self._target_lock: Optional[tuple[float, float]] = None
         self._last_mission_status = ""
-        self._scan_pause_after = "right"
+        self._scan_pause_after = "left"  # Зациклюємо сканування
 
         self._timer = QTimer(self)
         self._timer.setInterval(80)
@@ -121,9 +128,25 @@ class ColorFollowAutoPilot(QObject):
         self._emit_mission_status("Автопілот запущено")
 
     def stop(self) -> None:
-        self._timer.stop()
+        """Зупинити роботу автопілота та очистити пам'ять/YOLO."""
+        if self._timer.isActive():
+            self._timer.stop()
         self._last_command = None
-        self._lost_frames = 0
+        self._latest_frame = None
+        
+        # Очищення пам'яті (у т.ч. GPU), якщо використовувався детектор
+        if self._detector is not None:
+            self._detector = None
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+            except ImportError:
+                pass
+        import gc
+        gc.collect()
         self._reset_pin_mission()
         self.target_detected.emit(None)
         self.command_ready.emit("stop")
@@ -155,6 +178,8 @@ class ColorFollowAutoPilot(QObject):
         self._knocked_zones = []
         self._pins_knocked = 0
         self._ram_started_at = 0.0
+        self._ram_candidate_frames = 0
+        self._seek_lost_frames = 0
         self._close_tracking = False
         self._close_lost_frames = 0
         self._last_close_target = None
@@ -183,9 +208,16 @@ class ColorFollowAutoPilot(QObject):
             return
 
         if command == "stop":
+            should_hold_motion = target is None
+            if self._cfg.pin_mode_enabled and self._pin_state in {
+                PinMissionState.SCAN_PAUSE,
+                PinMissionState.MISSION_DONE,
+            }:
+                should_hold_motion = False
             self._lost_frames += 1
             if (
-                self._lost_frames < self._cfg.lost_frames_threshold
+                should_hold_motion
+                and self._lost_frames < self._cfg.lost_frames_threshold
                 and self._last_command is not None
                 and self._last_command != "stop"
             ):
@@ -225,10 +257,18 @@ class ColorFollowAutoPilot(QObject):
     ) -> tuple[Optional[str], Optional[dict], Optional[np.ndarray]]:
         h, w = frame.shape[:2]
         roi_top = int(h * self._cfg.roi_top_ratio)
-        roi = frame[roi_top:h, :, :]
+        blur_ksize = 5
+        blurred = cv2.GaussianBlur(frame, (blur_ksize, blur_ksize), 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        
+        # Вирівнювання яскравості (CLAHE) по каналу V для компенсації тіней
+        h_chan, s_chan, v_chan = cv2.split(hsv)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        v_chan = clahe.apply(v_chan)
+        hsv = cv2.merge([h_chan, s_chan, v_chan])
 
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        roi_mask = self._build_color_mask(hsv)
+        roi = hsv[roi_top:h, :, :]
+        roi_mask = self._build_color_mask(roi)
         preview_mask = (
             self._full_frame_mask(roi_mask, roi_top, frame.shape)
             if self._cfg.mask_preview_enabled
@@ -285,12 +325,9 @@ class ColorFollowAutoPilot(QObject):
             reverse=True,
         )
 
-        selected_pin = self._select_pin_target(
-            standing,
-            frame_w,
-            frame_h,
-            allow_retarget=self._pin_state != PinMissionState.RAM,
-        )
+        allow_retarget = self._pin_state != PinMissionState.RAM
+        selected_pin = self._select_pin_target(standing, frame_w, frame_h, allow_retarget=allow_retarget)
+
         target = dict(selected_pin) if selected_pin is not None else None
         if target is not None:
             target["confirmed"] = True
@@ -340,8 +377,18 @@ class ColorFollowAutoPilot(QObject):
 
         if self._pin_state == PinMissionState.RAM:
             target_standing = [selected_pin] if selected_pin is not None else []
-            knocked = self._check_pin_knocked(target_standing)
-            ram_timeout = (now - self._ram_started_at) >= self._cfg.max_ram_seconds
+            ram_elapsed = now - self._ram_started_at
+            ram_timeout = ram_elapsed >= self._cfg.max_ram_seconds
+            
+            # Завжди викликаємо _check_pin_knocked, щоб лічильник втрачених кадрів 
+            # правильно оновлювався, навіть якщо min_ram_seconds ще не минув.
+            is_knocked_logic = self._check_pin_knocked(target_standing)
+            
+            knocked = (
+                ram_elapsed >= self._cfg.min_ram_seconds
+                and is_knocked_logic
+            )
+            
             if knocked or ram_timeout:
                 self._register_knocked_pin(frame_w, frame_h)
                 self._begin_backup(now)
@@ -354,29 +401,39 @@ class ColorFollowAutoPilot(QObject):
                 self._emit_mission_status("Збивання кеглі!")
                 return "forward", ram_target, preview_mask
 
-            if self._close_tracking and self._close_lost_frames >= self._cfg.knock_lost_frames:
-                self._register_knocked_pin(frame_w, frame_h)
-                self._begin_backup(now)
-                return "backward", self._last_close_target, preview_mask
-
             self._emit_mission_status("Збивання кеглі!")
             return "forward", self._last_close_target, preview_mask
 
-        # SEEK: ціль не знайдена
-        if not standing:
+        # SEEK: ціль не знайдена або _select_pin_target повернув None
+        # (наприклад, усі кандидати вийшли із lock-радіусу).
+        if not standing or selected_pin is None:
+            self._seek_lost_frames += 1
+            if self._seek_lost_frames < self._cfg.lost_frames_threshold:
+                # Повертаємо stop, щоб _process_latest_frame підтримав попередню команду руху за інерцією
+                return "stop", None, preview_mask
+                
             self._close_tracking = False
             self._close_lost_frames = 0
             self._target_lock = None
+            self._ram_candidate_frames = 0
             self._begin_scan_left(now)
             return "left", None, preview_mask
 
-        # Ціль знайдена у режимі SEEK
-        seek_target = selected_pin if selected_pin is not None else standing[0]
+        # Ціль знайдена у режимі SEEK — завжди використовуємо selected_pin,
+        # бо саме вона пройшла через _select_pin_target зі scoring-логікою.
+        self._seek_lost_frames = 0
+        seek_target = selected_pin
         self._track_close_approach(seek_target)
 
-        if seek_target["area_ratio"] >= self._cfg.hit_area_ratio:
+        if self._is_ready_to_ram(seek_target, frame_w):
+            self._ram_candidate_frames += 1
+        else:
+            self._ram_candidate_frames = 0
+
+        if self._ram_candidate_frames >= self._cfg.ram_confirm_frames:
             self._pin_state = PinMissionState.RAM
             self._ram_started_at = now
+            self._ram_candidate_frames = 0
             self._close_lost_frames = 0
             ram_target = dict(seek_target)
             ram_target["pin_state"] = "ram"
@@ -396,6 +453,23 @@ class ColorFollowAutoPilot(QObject):
         if dx < -self._cfg.center_dead_zone:
             return "left"
         return "forward"
+
+    def _is_ready_to_ram(self, target: dict, frame_w: int) -> bool:
+        center_x = frame_w / 2.0
+        dx = abs((target["cx"] - center_x) / max(center_x, 1.0))
+        
+        # Якщо кегля дуже близько (велика площа), дозволяємо ширшу "мертву зону",
+        # щоб машинка не намагалася ідеально вирівняти величезний об'єкт і не "воблила" (overshoot).
+        dynamic_dead_zone = self._cfg.ram_center_dead_zone
+        if target["area_ratio"] > self._cfg.hit_area_ratio * 2.0:
+            dynamic_dead_zone *= 1.5
+            
+        dynamic_dead_zone = min(dynamic_dead_zone, 0.45) # Обмеження, щоб не промазати
+
+        return (
+            target["area_ratio"] >= self._cfg.hit_area_ratio
+            and dx <= dynamic_dead_zone
+        )
 
     def _is_standing_pin(self, candidate: dict) -> bool:
         return candidate["h"] >= candidate["w"] * self._cfg.standing_height_ratio
@@ -526,7 +600,8 @@ class ColorFollowAutoPilot(QObject):
             f"Їду назад {self._action_duration():.0f} с після збиття"
         )
 
-    def _begin_scan_left(self, now: float) -> None:
+        # Очищаємо список збитих зон при зміні позиції
+        self._knocked_zones.clear()
         self._pin_state = PinMissionState.SCAN_LEFT
         self._state_until = now + self._action_duration()
         self._last_command = None
@@ -550,7 +625,7 @@ class ColorFollowAutoPilot(QObject):
                 "Стоп 1 с — шукаю наступну кеглю"
             )
 
-    def _begin_scan_right(self, now: float) -> None:
+        self._knocked_zones.clear()
         self._pin_state = PinMissionState.SCAN_RIGHT
         self._state_until = now + self._action_duration()
         self._last_command = None
@@ -602,7 +677,17 @@ class ColorFollowAutoPilot(QObject):
             if box_area <= 0:
                 continue
 
-            area_ratio = box_area / frame_area
+            fill_ratio = area / box_area
+            if fill_ratio < self._cfg.min_fill_ratio:
+                continue
+
+            box_area_ratio = box_area / frame_area
+            contour_area_ratio = area / frame_area
+            # Дірява маска на блискучій/ребристій кеглі не має завищувати дистанцію до RAM.
+            area_ratio = max(
+                contour_area_ratio,
+                box_area_ratio * min(fill_ratio / self._cfg.solid_area_ratio, 1.0),
+            )
             aspect = max(w_box / max(h_box, 1), h_box / max(w_box, 1))
             if aspect > self._cfg.max_aspect_ratio:
                 continue
@@ -628,6 +713,8 @@ class ColorFollowAutoPilot(QObject):
                     "cx": x + w_box / 2.0,
                     "cy": y_full + h_box / 2.0,
                     "area": area,
+                    "box_area_ratio": box_area_ratio,
+                    "fill_ratio": fill_ratio,
                     "area_ratio": area_ratio,
                 }
             )
