@@ -37,6 +37,9 @@ from backend.video_client import VideoStreamThread
 from backend.wifi import WifiProvisioningClient
 from config.settings import (
     APP_NAME,
+    AUTOPILOT_BACKUP_SPEED,
+    AUTOPILOT_HIT_SPEED,
+    AUTOPILOT_SCAN_SPEED,
     DEFAULT_HOST,
     DEFAULT_SETUP_HOST,
     DEFAULT_SPEED,
@@ -105,6 +108,7 @@ class MainWindow(QMainWindow):
         self._pending_stop = False
         self._led_in_flight = False
         self._speed_in_flight = False
+        self._last_sent_speed: int | None = None
 
         # Прапорці відключення і відновлення розрізняють ручне відключення та втрату зв’язку.
         self._disconnect_requested = False
@@ -714,7 +718,13 @@ class MainWindow(QMainWindow):
             return
         self._send_motion(self._active_motion_command, show_success=False)
 
-    def _send_motion(self, command: str, *, show_success: bool = True) -> None:
+    def _send_motion(
+        self,
+        command: str,
+        *,
+        show_success: bool = True,
+        speed_override: int | None = None,
+    ) -> None:
         """Надіслати команду руху у фоновому потоці."""
         if command == "stop":
             self._send_stop()
@@ -731,22 +741,35 @@ class MainWindow(QMainWindow):
             return
 
         client = self.robot_client
-        speed = self.speed_spin.value()
+        speed = RobotClient.clamp_speed(
+            speed_override if speed_override is not None else self.speed_spin.value()
+        )
+        should_send_speed = speed != self._last_sent_speed
         self._motion_command_in_flight = True
 
-        def action() -> str:
+        def action() -> tuple[str, int | None]:
             """Надіслати одну команду руху з поточною швидкістю."""
-            client.set_speed(speed)
+            sent_speed: int | None = None
+            if should_send_speed:
+                client.send_speed(speed)
+                sent_speed = speed
+            else:
+                client.set_speed(speed)
             result = client.send_motion_command(command)
             response = f": {result.response_text}" if result.response_text else ""
-            return f"Команда {command} виконана{response}"
+            return f"Команда {command} виконана{response}", sent_speed
 
         def on_success(message: object) -> None:
             """Обробити успішне виконання команди руху."""
             self._motion_command_in_flight = False
             self._record_robot_success()
+            status_message = message
+            if isinstance(message, tuple):
+                status_message, sent_speed = message
+                if isinstance(sent_speed, int):
+                    self._last_sent_speed = sent_speed
             if show_success:
-                self._show_status_success(message)
+                self._show_status_success(status_message)
             self._after_robot_request_finished()
 
         def on_error(message: str) -> None:
@@ -802,6 +825,10 @@ class MainWindow(QMainWindow):
 
     def _send_current_speed(self) -> None:
         """Надіслати поточне значення швидкості, якщо робот готовий."""
+        self._send_speed_value(self.speed_spin.value(), show_success=True)
+
+    def _send_speed_value(self, speed: int, *, show_success: bool) -> None:
+        """Надіслати конкретне PWM-значення швидкості без зміни UI."""
         if (
             not self._connected
             or self.robot_client is None
@@ -812,7 +839,10 @@ class MainWindow(QMainWindow):
             return
 
         client = self.robot_client
-        speed = self.speed_spin.value()
+        speed = RobotClient.clamp_speed(speed)
+        if speed == self._last_sent_speed:
+            return
+
         self._speed_in_flight = True
 
         def action() -> str:
@@ -824,8 +854,10 @@ class MainWindow(QMainWindow):
         def on_success(message: object) -> None:
             """Обробити успішне встановлення швидкості."""
             self._speed_in_flight = False
+            self._last_sent_speed = speed
             self._record_robot_success()
-            self._show_status_success(message)
+            if show_success:
+                self._show_status_success(message)
             self._after_robot_request_finished()
 
         def on_error(message: str) -> None:
@@ -1113,6 +1145,7 @@ class MainWindow(QMainWindow):
         if self.robot_client is not None:
             self.robot_client.close(send_stop=send_stop)
             self.robot_client = None
+        self._last_sent_speed = None
 
     # ------------------------------------------------------------------ worker helper
 
@@ -1387,6 +1420,7 @@ class MainWindow(QMainWindow):
         self._autopilot_mask = None
         self._autopilot.deleteLater()
         self._autopilot = None
+        self._send_stop()
 
         for button in (
             self.forward_button,
@@ -1425,6 +1459,20 @@ class MainWindow(QMainWindow):
         if self.autopilot_checkbox.isChecked():
             self.autopilot_checkbox.setChecked(False)
 
+    def _autopilot_speed_for_command(self, command: str) -> int:
+        """Підібрати швидкість автопілота для поточної фази руху."""
+        base_speed = RobotClient.clamp_speed(self.speed_spin.value())
+        target = self._autopilot_target or {}
+        pin_state = target.get("pin_state")
+
+        if command == "forward" and pin_state == "ram":
+            return max(base_speed, AUTOPILOT_HIT_SPEED)
+        if command == "backward":
+            return max(base_speed, AUTOPILOT_BACKUP_SPEED)
+        if command in {"left", "right"} and self._autopilot_target is None:
+            return min(base_speed, AUTOPILOT_SCAN_SPEED)
+        return base_speed
+
     def _on_autopilot_command(self, command: str) -> None:
         """Прийняти команду руху від автопілота та відправити її роботу."""
         if not self._autopilot_enabled:
@@ -1433,15 +1481,23 @@ class MainWindow(QMainWindow):
             return
 
         if command == "stop":
-            if self._active_motion_command is not None:
-                self._send_stop()
+            # Stop має гасити keep-alive незалежно від локального стану останньої команди.
+            self._motion_keepalive_timer.stop()
+            self._send_stop()
             return
 
+        speed = self._autopilot_speed_for_command(command)
         if command == self._active_motion_command:
+            # Та сама команда вже активна — keepalive її повторює, нічого не робимо
+            self._send_speed_value(speed, show_success=False)
+            if not self._motion_keepalive_timer.isActive():
+                self._motion_keepalive_timer.start()
             return
 
+        # При зміні напряму спочатку зупиняємо keep-alive старої команди.
+        self._motion_keepalive_timer.stop()
         self._active_motion_command = command
-        self._send_motion(command, show_success=False)
+        self._send_motion(command, show_success=False, speed_override=speed)
         self._motion_keepalive_timer.start()
 
     def _draw_autopilot_overlay(self, pixmap: QPixmap) -> QPixmap:

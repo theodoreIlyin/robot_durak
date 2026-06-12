@@ -34,6 +34,11 @@ VIDEO_RECONNECT_DELAY_SECONDS = 1.0
 MOTION_WATCHDOG_MS = 500
 MOTION_KEEPALIVE_INTERVAL_MS = 300
 
+# Швидкості автопілота: повільніше сканування, швидший таран і від'їзд після збиття.
+AUTOPILOT_SCAN_SPEED = 130
+AUTOPILOT_HIT_SPEED = 240
+AUTOPILOT_BACKUP_SPEED = 220
+
 # Поріг помилок і таймер перепідключення керують автоматичним відновленням зв’язку.
 ROBOT_ERROR_THRESHOLD = 5
 ROBOT_RECONNECT_INTERVAL_MS = 2000

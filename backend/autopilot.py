@@ -39,7 +39,8 @@ class AutoPilotConfig:
     min_area: int = 150
     mask_preview_enabled: bool = True
     frame_skip: int = 2
-    lost_frames_threshold: int = 4
+    # Коротка втрата цілі не повинна одразу переривати рух.
+    lost_frames_threshold: int = 8
 
     shape_filter_enabled: bool = True
     min_circularity: float = 0.08
@@ -52,16 +53,21 @@ class AutoPilotConfig:
     detector_img_size: int = 416
     detector_target_classes: Sequence[str] = field(default_factory=tuple)
 
-    center_dead_zone: float = 0.18
+    # Ширша мертва зона зменшує мікроповороти на місці.
+    center_dead_zone: float = 0.20
     too_close_area_ratio: float = 0.28
 
     # Режим збивання кегель
     pin_mode_enabled: bool = True
-    standing_height_ratio: float = 1.1   # h/w: стояча кегля вища за широку
-    hit_area_ratio: float = 0.10         # почати таран, коли кегля велика в кадрі
+    # Стоячою вважається кегля, у якої висота достатньо більша за ширину.
+    standing_height_ratio: float = 1.3
+    # Починаємо таран раніше, не чекаючи поки кегля займе 10% кадру.
+    hit_area_ratio: float = 0.07
     knocked_zone_radius: float = 0.18    # нормалізований радіус «вже збито»
+    target_lock_radius: float = 0.12     # радіус утримання вже обраної цілі
     knock_lost_frames: int = 3           # кадрів без стоячої цілі після зближення
-    action_seconds: float = 5.0        # кожна дія (назад, огляд, пауза) = 5 с
+    # Коротший час сканування, щоб робот швидше припиняв обертання без цілі.
+    action_seconds: float = 2.5
     max_ram_seconds: float = 1.4
 
 
@@ -91,6 +97,7 @@ class ColorFollowAutoPilot(QObject):
         self._close_tracking = False
         self._close_lost_frames = 0
         self._last_close_target: Optional[dict] = None
+        self._target_lock: Optional[tuple[float, float]] = None
         self._last_mission_status = ""
         self._scan_pause_after = "right"
 
@@ -151,6 +158,7 @@ class ColorFollowAutoPilot(QObject):
         self._close_tracking = False
         self._close_lost_frames = 0
         self._last_close_target = None
+        self._target_lock = None
         self._last_mission_status = ""
         self._scan_pause_after = "right"
 
@@ -272,9 +280,18 @@ class ColorFollowAutoPilot(QObject):
 
         standing = self._standing_pins(candidates)
         standing = [c for c in standing if not self._in_knocked_zone(c, frame_w, frame_h)]
-        standing.sort(key=lambda c: (c["area"], -abs(c["cx"] - frame_w / 2)), reverse=True)
+        standing.sort(
+            key=lambda c: self._pin_target_score(c, frame_w, frame_h),
+            reverse=True,
+        )
 
-        target = dict(standing[0]) if standing else None
+        selected_pin = self._select_pin_target(
+            standing,
+            frame_w,
+            frame_h,
+            allow_retarget=self._pin_state != PinMissionState.RAM,
+        )
+        target = dict(selected_pin) if selected_pin is not None else None
         if target is not None:
             target["confirmed"] = True
             target["pin_state"] = "standing"
@@ -292,18 +309,18 @@ class ColorFollowAutoPilot(QObject):
             return "left", target, preview_mask
 
         if self._pin_state == PinMissionState.SCAN_LEFT:
-            if standing:
+            if selected_pin is not None:
                 self._on_pin_found_during_scan()
-                return self._approach_found_pin(standing[0], frame_w, target, preview_mask)
+                return self._approach_found_pin(selected_pin, frame_w, target, preview_mask)
             if now < self._state_until:
                 return "left", None, preview_mask
             self._begin_scan_pause(now, after="right")
             return "stop", None, preview_mask
 
         if self._pin_state == PinMissionState.SCAN_PAUSE:
-            if standing:
+            if selected_pin is not None:
                 self._on_pin_found_during_scan()
-                return self._approach_found_pin(standing[0], frame_w, target, preview_mask)
+                return self._approach_found_pin(selected_pin, frame_w, target, preview_mask)
             if now < self._state_until:
                 return "stop", None, preview_mask
             if self._scan_pause_after == "right":
@@ -313,30 +330,30 @@ class ColorFollowAutoPilot(QObject):
             return "stop", None, preview_mask
 
         if self._pin_state == PinMissionState.SCAN_RIGHT:
-            if standing:
+            if selected_pin is not None:
                 self._on_pin_found_during_scan()
-                return self._approach_found_pin(standing[0], frame_w, target, preview_mask)
+                return self._approach_found_pin(selected_pin, frame_w, target, preview_mask)
             if now < self._state_until:
                 return "right", None, preview_mask
             self._begin_scan_pause(now, after="finish")
             return "stop", None, preview_mask
 
         if self._pin_state == PinMissionState.RAM:
-            knocked = self._check_pin_knocked(standing)
+            target_standing = [selected_pin] if selected_pin is not None else []
+            knocked = self._check_pin_knocked(target_standing)
             ram_timeout = (now - self._ram_started_at) >= self._cfg.max_ram_seconds
             if knocked or ram_timeout:
                 self._register_knocked_pin(frame_w, frame_h)
                 self._begin_backup(now)
                 return "backward", self._last_close_target, preview_mask
 
-            if standing:
-                self._track_close_approach(standing[0])
-                ram_target = dict(standing[0])
+            if selected_pin is not None:
+                self._track_close_approach(selected_pin)
+                ram_target = dict(selected_pin)
                 ram_target["pin_state"] = "ram"
                 self._emit_mission_status("Збивання кеглі!")
                 return "forward", ram_target, preview_mask
 
-            self._close_lost_frames += 1
             if self._close_tracking and self._close_lost_frames >= self._cfg.knock_lost_frames:
                 self._register_knocked_pin(frame_w, frame_h)
                 self._begin_backup(now)
@@ -345,14 +362,16 @@ class ColorFollowAutoPilot(QObject):
             self._emit_mission_status("Збивання кеглі!")
             return "forward", self._last_close_target, preview_mask
 
-        # SEEK
+        # SEEK: ціль не знайдена
         if not standing:
             self._close_tracking = False
             self._close_lost_frames = 0
+            self._target_lock = None
             self._begin_scan_left(now)
             return "left", None, preview_mask
 
-        seek_target = standing[0]
+        # Ціль знайдена у режимі SEEK
+        seek_target = selected_pin if selected_pin is not None else standing[0]
         self._track_close_approach(seek_target)
 
         if seek_target["area_ratio"] >= self._cfg.hit_area_ratio:
@@ -383,6 +402,54 @@ class ColorFollowAutoPilot(QObject):
 
     def _standing_pins(self, candidates: list[dict]) -> list[dict]:
         return [c for c in candidates if self._is_standing_pin(c)]
+
+    def _pin_target_score(self, candidate: dict, frame_w: int, frame_h: int) -> float:
+        """Оцінити кандидата так, щоб робот тримав зрозумілу центральну ціль."""
+        center_x = frame_w / 2.0
+        center_error = abs(candidate["cx"] - center_x) / max(center_x, 1.0)
+        centered = 1.0 - min(center_error, 1.0)
+        close_enough = min(
+            candidate["area_ratio"] / max(self._cfg.hit_area_ratio, 0.001),
+            1.5,
+        )
+        lower_in_frame = min(candidate["cy"] / max(frame_h, 1), 1.0)
+        return close_enough * 0.55 + centered * 0.35 + lower_in_frame * 0.10
+
+    def _select_pin_target(
+        self,
+        standing: list[dict],
+        frame_w: int,
+        frame_h: int,
+        *,
+        allow_retarget: bool = True,
+    ) -> Optional[dict]:
+        """Вибрати одну стоячу кеглю і втримувати її між кадрами."""
+        if not standing:
+            return None
+
+        if self._target_lock is not None:
+            locked_x, locked_y = self._target_lock
+            radius_sq = self._cfg.target_lock_radius * self._cfg.target_lock_radius
+            nearest = min(
+                standing,
+                key=lambda c: (
+                    (c["cx"] / frame_w - locked_x) ** 2
+                    + (c["cy"] / frame_h - locked_y) ** 2
+                ),
+            )
+            nx, ny = self._normalized_center(nearest, frame_w, frame_h)
+            if (nx - locked_x) ** 2 + (ny - locked_y) ** 2 <= radius_sq:
+                self._target_lock = (nx, ny)
+                return nearest
+            if not allow_retarget:
+                return None
+
+        selected = max(
+            standing,
+            key=lambda c: self._pin_target_score(c, frame_w, frame_h),
+        )
+        self._target_lock = self._normalized_center(selected, frame_w, frame_h)
+        return selected
 
     def _normalized_center(self, candidate: dict, frame_w: int, frame_h: int) -> tuple[float, float]:
         return candidate["cx"] / frame_w, candidate["cy"] / frame_h
@@ -445,6 +512,7 @@ class ColorFollowAutoPilot(QObject):
         self._pins_knocked += 1
         self._close_tracking = False
         self._close_lost_frames = 0
+        self._target_lock = None
         self._emit_mission_status(f"Кеглю збито! Всього: {self._pins_knocked}")
 
     def _action_duration(self) -> float:
@@ -469,16 +537,17 @@ class ColorFollowAutoPilot(QObject):
 
     def _begin_scan_pause(self, now: float, after: str) -> None:
         self._pin_state = PinMissionState.SCAN_PAUSE
-        self._state_until = now + self._action_duration()
+        # Пауза коротша за огляд, щоб робот не стояв зайво довго між напрямками.
+        self._state_until = now + min(1.0, self._action_duration())
         self._scan_pause_after = after
         self._last_command = None
         if after == "right":
             self._emit_mission_status(
-                f"Стоп {self._action_duration():.0f} с — потім огляд праворуч"
+                "Стоп 1 с — потім огляд праворуч"
             )
         else:
             self._emit_mission_status(
-                f"Стоп {self._action_duration():.0f} с — шукаю наступну кеглю"
+                "Стоп 1 с — шукаю наступну кеглю"
             )
 
     def _begin_scan_right(self, now: float) -> None:
@@ -506,6 +575,7 @@ class ColorFollowAutoPilot(QObject):
 
     def _finish_mission(self) -> None:
         self._pin_state = PinMissionState.MISSION_DONE
+        self._target_lock = None
         self._emit_mission_status(
             f"Місію завершено! Збито кегель потрібного кольору: {self._pins_knocked}"
         )
@@ -562,10 +632,8 @@ class ColorFollowAutoPilot(QObject):
                 }
             )
 
-            if len(candidates) >= self._cfg.max_candidates:
-                break
-
-        return candidates
+        candidates.sort(key=lambda c: c["area"], reverse=True)
+        return candidates[: self._cfg.max_candidates]
 
     def _validate_with_detector(self, frame: np.ndarray, target: dict) -> bool:
         if not self._detector_available or self._detector is None:

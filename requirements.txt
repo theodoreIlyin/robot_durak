@@ -1,6 +1,7 @@
-PyQt5>=5.15.10,<6
-requests>=2.31.0,<3
-websocket-client>=1.8.0,<2
-opencv-python>=4.9.0.80,<5
-numpy>=1.26.0,<3
-ultralytics>=8.0.0
+# Recommended runtime: Python 3.12.x.
+PyQt5>=5.15.11,<6
+requests>=2.34.2,<3
+websocket-client>=1.9.0,<2
+opencv-python>=4.13.0.92,<5
+numpy>=2.4.6,<3
+ultralytics>=8.4.66,<9
