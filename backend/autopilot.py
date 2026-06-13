@@ -42,7 +42,7 @@ class AutoPilotConfig:
     lost_frames_threshold: int = 4
 
     shape_filter_enabled: bool = True
-    min_circularity: float = 0.08
+    min_circularity: float = 0.05          # ← ЗМІНЕНО (було 0.08)
     min_rectangularity: float = 0.40
     max_aspect_ratio: float = 4.0
     max_candidates: int = 8
@@ -57,11 +57,11 @@ class AutoPilotConfig:
 
     # Режим збивання кегель
     pin_mode_enabled: bool = True
-    standing_height_ratio: float = 1.1   # h/w: стояча кегля вища за широку
-    hit_area_ratio: float = 0.10         # почати таран, коли кегля велика в кадрі
-    knocked_zone_radius: float = 0.18    # нормалізований радіус «вже збито»
-    knock_lost_frames: int = 3           # кадрів без стоячої цілі після зближення
-    action_seconds: float = 5.0        # кожна дія (назад, огляд, пауза) = 5 с
+    standing_height_ratio: float = 0.90    # ← ЗМІНЕНО (було 1.1)
+    hit_area_ratio: float = 0.10
+    knocked_zone_radius: float = 0.18
+    knock_lost_frames: int = 3
+    action_seconds: float = 5.0
     max_ram_seconds: float = 1.4
 
 
@@ -274,6 +274,11 @@ class ColorFollowAutoPilot(QObject):
         standing = [c for c in standing if not self._in_knocked_zone(c, frame_w, frame_h)]
         standing.sort(key=lambda c: (c["area"], -abs(c["cx"] - frame_w / 2)), reverse=True)
 
+        # === НОВИЙ FALLBACK (щоб не крутився даремно) ===
+        if not standing and candidates:
+            candidates_sorted = sorted(candidates, key=lambda c: c["area"], reverse=True)
+            standing = [candidates_sorted[0]]
+
         target = dict(standing[0]) if standing else None
         if target is not None:
             target["confirmed"] = True
@@ -401,7 +406,6 @@ class ColorFollowAutoPilot(QObject):
         return False
 
     def _remember_fallen_pins(self, candidates: list[dict], frame_w: int, frame_h: int) -> None:
-        """Лежачі плями кольору біля останньої цілі теж позначаємо як «вже збито»."""
         if self._last_close_target is None:
             return
         last_nx = self._last_close_target["cx"] / frame_w
